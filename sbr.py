@@ -8,7 +8,7 @@ import argparse
 
 CONFIG_PATH = Path.home() / ".deploy_manager"
 REPOSITORIES_FILE = CONFIG_PATH / "repositories.txt"
-DEFAULT_BACKUP_ROOT = Path("$HOME/.backup")
+DEFAULT_BACKUP_ROOT = Path(os.path.expanduser("~")) / ".backup"
 
 def ensure_config_directory_exists():
     CONFIG_PATH.mkdir(parents=True, exist_ok=True)
