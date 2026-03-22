@@ -7,7 +7,7 @@ SBR is a simple deployment and backup manager for your projects.
 Run the following command on your Linux machine:
 
 ~~~bash
-bash -c "$(curl -fsSL https://yourdomain.com/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/VerumHades/sbr/main/install.sh)"
 ~~~
 
 This will:
