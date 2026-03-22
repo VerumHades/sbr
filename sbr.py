@@ -1,248 +1,253 @@
 #!/usr/bin/env python3
 
+import argparse
 import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
-import argparse
 
-CONFIG_PATH = Path.home() / ".deploy_manager"
-REPOSITORIES_FILE = CONFIG_PATH / "repositories.txt"
-DEFAULT_BACKUP_ROOT = Path(os.path.expanduser("~")) / ".backup"
-print(DEFAULT_BACKUP_ROOT)
-
-def ensure_config_directory_exists():
-    CONFIG_PATH.mkdir(parents=True, exist_ok=True)
-    if not REPOSITORIES_FILE.exists():
-        REPOSITORIES_FILE.touch()
+# Configuration Constants
+CONFIG_DIRECTORY = Path.home() / ".deploy_manager"
+REGISTRY_FILE = CONFIG_DIRECTORY / "repositories.txt"
+DEFAULT_BACKUP_ROOT = Path.home() / ".backup"
 
 
-def read_registered_repositories():
-    ensure_config_directory_exists()
+def ensure_configuration_exists():
+    """Initializes the configuration directory and registry file."""
+    CONFIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    if not REGISTRY_FILE.exists():
+        REGISTRY_FILE.touch()
+
+
+def get_registered_repositories():
+    """Reads the registry and returns a mapping of aliases to Path objects."""
+    ensure_configuration_exists()
     repositories = {}
-    with open(REPOSITORIES_FILE, "r") as file_handle:
+    with REGISTRY_FILE.open("r") as file_handle:
         for line in file_handle:
-            if line.strip():
-                alias, path = line.strip().split("|", 1)
-                repositories[alias] = path
+            clean_line = line.strip()
+            if clean_line:
+                alias, path_string = clean_line.split("|", 1)
+                repositories[alias] = Path(path_string)
     return repositories
 
 
-def write_repository(alias, repository_path):
-    ensure_config_directory_exists()
-    with open(REPOSITORIES_FILE, "a") as file_handle:
+def save_repository_registration(alias, repository_path):
+    """Persists a new repository alias and path to the registry."""
+    ensure_configuration_exists()
+    with REGISTRY_FILE.open("a") as file_handle:
         file_handle.write(f"{alias}|{repository_path}\n")
 
-def run_command_with_elevation(command_parts, working_directory=None):
+
+def execute_shell_command(command_parts, working_directory=None):
     """
-    Runs a shell command. If it fails due to permission denied, asks for elevation.
+    Executes a system command. 
+    Attempts elevation via sudo if initial permission is denied.
     """
     try:
         subprocess.run(command_parts, check=True, cwd=working_directory)
-    except subprocess.CalledProcessError as e:
-        if e.returncode == 1 or e.returncode == 13:  # 13 = Permission denied
-            print("Command failed due to permission issues. Trying with sudo...")
-            sudo_command = ["sudo"] + command_parts
-            subprocess.run(sudo_command, check=True, cwd=working_directory)
+    except subprocess.CalledProcessError as error:
+        if error.returncode in [1, 13]:
+            print("Permission denied. Retrying with sudo...")
+            elevated_command = ["sudo"] + command_parts
+            subprocess.run(elevated_command, check=True, cwd=working_directory)
         else:
             raise
 
-def run_command_with_elevation(command_parts, working_directory=None):
-    subprocess.run(command_parts, check=True, cwd=working_directory)
+
+def extract_database_url(repository_path):
+    """Parses the .env file within the backend directory for DATABASE_URL."""
+    env_file = repository_path / "backend" / ".env"
+    if not env_file.exists():
+        return None
+
+    with env_file.open("r") as file_handle:
+        for line in file_handle:
+            if line.startswith("DATABASE_URL="):
+                return line.split("=", 1)[1].strip()
+    return None
 
 
-def create_backup(repository_path, backup_root):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    project_name = repository_path.name
-    backup_path = backup_root / f"{project_name}_{timestamp}"
+def backup_database(repository_path, backup_destination):
+    """Detects database type and creates a SQL dump inside the backup folder."""
+    database_url = extract_database_url(repository_path)
+    if not database_url:
+        return
 
-    backup_root.mkdir(parents=True, exist_ok=True)
-
-    run_command_with_elevation([
-        "rsync", "-a", "--delete",
-        "--exclude=.git",
-        "--exclude=node_modules",
-        "--exclude=vendor",
-        "--exclude=var/cache",
-        "--exclude=var/log",
-        f"{repository_path}/",
-        str(backup_path)
-    ])
-
-    env_path = repository_path / "backend/.env"
-    if env_path.exists():
-        database_url = None
-        with open(env_path) as file_handle:
-            for line in file_handle:
-                if line.startswith("DATABASE_URL="):
-                    database_url = line.split("=", 1)[1].strip()
-                    break
-
-        if database_url:
-            if database_url.startswith("mysql"):
-                run_command_with_elevation(["bash", "-c", f"mysqldump '{database_url}' > '{backup_path}/database.sql'"])
-            elif database_url.startswith("postgres"):
-                run_command_with_elevation(["bash", "-c", f"pg_dump '{database_url}' > '{backup_path}/database.sql'"])
-
-    print(f"Backup created at {backup_path}")
+    output_file = backup_destination / "database.sql"
+    if database_url.startswith("mysql"):
+        execute_shell_command(["mysqldump", database_url, f"--result-file={output_file}"])
+    elif database_url.startswith("postgres"):
+        execute_shell_command(["pg_dump", database_url, "-f", str(output_file)])
 
 
-def list_backups(repository_path, backup_root):
-    project_name = repository_path.name
-    if not backup_root.exists():
-        return []
-
-    backups = [
-        path for path in backup_root.iterdir()
-        if path.is_dir() and path.name.startswith(project_name + "_")
+def perform_rsync_backup(source_path, destination_path):
+    """Executes rsync to copy project files, excluding transient directories."""
+    exclude_list = [
+        "--exclude=.git", "--exclude=node_modules", "--exclude=vendor",
+        "--exclude=var/cache", "--exclude=var/log"
     ]
+    rsync_command = ["rsync", "-a", "--delete"] + exclude_list + [f"{source_path}/", str(destination_path)]
+    execute_shell_command(rsync_command)
 
-    return sorted(backups)
+
+def create_project_backup(repository_path, backup_root):
+    """Orchestrates the full file and database backup process."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = backup_root / f"{repository_path.name}_{timestamp}"
+    
+    backup_root.mkdir(parents=True, exist_ok=True)
+    
+    perform_rsync_backup(repository_path, backup_path)
+    backup_database(repository_path, backup_path)
+    
+    print(f"Backup created at: {backup_path}")
+    return backup_path
+
+
+def get_current_git_branch(repository_path):
+    """Returns the name of the currently active git branch."""
+    output = subprocess.check_output(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=repository_path
+    )
+    return output.decode().strip()
+
+
+def sync_git_repository(repository_path):
+    """Fetches remote changes and hard resets the local branch to match origin."""
+    execute_shell_command(["git", "fetch", "origin"], repository_path)
+    current_branch = get_current_git_branch(repository_path)
+    execute_shell_command(["git", "reset", "--hard", f"origin/{current_branch}"], repository_path)
+
+
+def build_frontend_assets(repository_path):
+    """Runs npm install and production build for the frontend."""
+    frontend_path = repository_path / "frontend"
+    if frontend_path.exists():
+        execute_shell_command(["npm", "install"], frontend_path)
+        execute_shell_command(["npm", "run", "build"], frontend_path)
+
+
+def build_backend_application(repository_path):
+    """Runs composer install and doctrine migrations for the backend."""
+    backend_path = repository_path / "backend"
+    if backend_path.exists():
+        composer_cmd = ["composer", "install", "--no-dev", "--optimize-autoloader"]
+        execute_shell_command(composer_cmd, backend_path)
+        
+        migration_cmd = ["php", "bin/console", "doctrine:migrations:migrate", "--no-interaction"]
+        execute_shell_command(migration_cmd, backend_path)
 
 
 def command_register(args):
-    """Register a new repository with an alias.
-
-Positional arguments:
-  alias        The alias name for the repository
-  path         The full path to the repository (optional, defaults to current directory)"""
+    """CLI: Registers a new repository alias."""
     alias = args.alias
-    repository_path = args.path or os.getcwd()
-
-    write_repository(alias, repository_path)
-    print(f"Repository '{alias}' registered for path {repository_path}.")
+    repository_path = Path(args.path or os.getcwd()).resolve()
+    save_repository_registration(alias, repository_path)
+    print(f"Registered '{alias}' at {repository_path}")
 
 
 def command_list(args):
-    """List all registered repositories with their aliases."""
-    repositories = read_registered_repositories()
+    """CLI: Lists all registered repositories."""
+    repositories = get_registered_repositories()
     for alias, path in repositories.items():
         print(f"{alias} -> {path}")
 
 
 def command_backup(args):
-    """Create a backup of the repository specified by alias.
-
-Positional arguments:
-  alias        The alias of the repository to backup"""
-    repositories = read_registered_repositories()
-    repository_path = repositories.get(args.alias)
-    if not repository_path:
+    """CLI: Manually triggers a backup."""
+    repositories = get_registered_repositories()
+    path = repositories.get(args.alias)
+    if not path:
         print(f"Alias '{args.alias}' not found.")
         return
 
-    create_backup(Path(repository_path), Path(args.backup_root))
+    create_project_backup(path, Path(args.backup_root))
 
 
 def command_restore(args):
-    """Restore a repository from a backup.
-
-Positional arguments:
-  alias        The alias of the repository to restore"""
-    repositories = read_registered_repositories()
-    repository_path = repositories.get(args.alias)
-    if not repository_path:
+    """CLI: Restores a repository from a selected backup."""
+    repositories = get_registered_repositories()
+    path = repositories.get(args.alias)
+    if not path:
         print(f"Alias '{args.alias}' not found.")
         return
 
-    backups = list_backups(Path(repository_path), Path(args.backup_root))
+    backup_root = Path(args.backup_root)
+    backups = sorted([p for p in backup_root.iterdir() if p.name.startswith(f"{path.name}_")])
+
     if not backups:
         print("No backups available.")
         return
 
-    print("Available backups:")
-    for i, backup in enumerate(backups):
-        print(f"[{i}] {backup}")
-    selection = input("Select backup index: ").strip()
-    if not selection.isdigit() or int(selection) >= len(backups):
-        print("Invalid selection")
-        return
+    for index, backup in enumerate(backups):
+        print(f"[{index}] {backup.name}")
 
-    selected_backup = backups[int(selection)]
-    run_command_with_elevation([
-        "rsync", "-a", "--delete",
-        f"{selected_backup}/",
-        str(repository_path)
-    ])
-    print("Restore completed")
+    selection = input("Select backup index: ").strip()
+    if selection.isdigit() and int(selection) < len(backups):
+        selected_backup = backups[int(selection)]
+        execute_shell_command(["rsync", "-a", "--delete", f"{selected_backup}/", str(path)])
+        print("Restore completed.")
+    else:
+        print("Invalid selection.")
 
 
 def command_deploy(args):
-    """
-        Deploy the repository specified by alias.
-        Positional arguments:
-        alias        The alias of the repository to deploy
-    """
-    repositories = read_registered_repositories()
-    repository_path = repositories.get(args.alias)
-    if not repository_path:
+    """CLI: Orchestrates the full backup and deployment sequence."""
+    repositories = get_registered_repositories()
+    path = repositories.get(args.alias)
+    if not path:
         print(f"Alias '{args.alias}' not found.")
         return
 
-    repository_path = Path(repository_path)
-    create_backup(repository_path, Path(args.backup_root))
-
-    run_command_with_elevation(["git", "fetch", "origin"], repository_path)
-
-    current_branch = subprocess.check_output(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=repository_path
-    ).decode().strip()
-
-    run_command_with_elevation(["git", "reset", "--hard", f"origin/{current_branch}"], repository_path)
-
-    frontend_path = repository_path / "frontend"
-    backend_path = repository_path / "backend"
-
-    run_command_with_elevation(["npm", "install"], frontend_path)
-    run_command_with_elevation(["npm", "run", "build"], frontend_path)
-
-    run_command_with_elevation(["composer", "install", "--no-dev", "--optimize-autoloader"], backend_path)
-    run_command_with_elevation(["php", "bin/console", "doctrine:migrations:migrate", "--no-interaction"], backend_path)
-
-    run_command_with_elevation(["systemctl", "restart", "caddy"])
-    print("Deployment completed")
+    create_project_backup(path, Path(args.backup_root))
+    sync_git_repository(path)
+    build_frontend_assets(path)
+    build_backend_application(path)
+    
+    execute_shell_command(["systemctl", "restart", "caddy"])
+    print("Deployment successfully finished.")
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(description="Deployment and Backup Manager")
+def build_argument_parser():
+    """Defines the CLI structure and subcommands."""
+    parser = argparse.ArgumentParser(description="Deployment Manager")
     subparsers = parser.add_subparsers(dest="command")
 
-    register_parser = subparsers.add_parser("register", help="Register a new repository with an alias")
-    register_parser.add_argument("alias", help="Alias name for the repository")
-    register_parser.add_argument("path", nargs='?', help="Repository path (optional, defaults to current directory)")
-    register_parser.set_defaults(func=command_register)
+    reg = subparsers.add_parser("register")
+    reg.add_argument("alias")
+    reg.add_argument("path", nargs='?')
+    reg.set_defaults(func=command_register)
 
-    list_parser = subparsers.add_parser("list", help="List all registered repositories")
-    list_parser.set_defaults(func=command_list)
+    subparsers.add_parser("list").set_defaults(func=command_list)
 
-    backup_parser = subparsers.add_parser("backup", help="Backup a repository using its alias")
-    backup_parser.add_argument("alias", help="Alias of the repository to backup")
-    backup_parser.add_argument("--backup-root", default=str(DEFAULT_BACKUP_ROOT), help="Root directory for backups")
-    backup_parser.set_defaults(func=command_backup)
+    back = subparsers.add_parser("backup")
+    back.add_argument("alias")
+    back.add_argument("--backup-root", default=str(DEFAULT_BACKUP_ROOT))
+    back.set_defaults(func=command_backup)
 
-    restore_parser = subparsers.add_parser("restore", help="Restore a repository from backup using its alias")
-    restore_parser.add_argument("alias", help="Alias of the repository to restore")
-    restore_parser.add_argument("--backup-root", default=str(DEFAULT_BACKUP_ROOT), help="Root directory for backups")
-    restore_parser.set_defaults(func=command_restore)
+    rest = subparsers.add_parser("restore")
+    rest.add_argument("alias")
+    rest.add_argument("--backup-root", default=str(DEFAULT_BACKUP_ROOT))
+    rest.set_defaults(func=command_restore)
 
-    deploy_parser = subparsers.add_parser("deploy", help="Deploy a repository using its alias")
-    deploy_parser.add_argument("alias", help="Alias of the repository to deploy")
-    deploy_parser.add_argument("--backup-root", default=str(DEFAULT_BACKUP_ROOT), help="Root directory for backups")
-    deploy_parser.set_defaults(func=command_deploy)
+    depl = subparsers.add_parser("deploy")
+    depl.add_argument("alias")
+    depl.add_argument("--backup-root", default=str(DEFAULT_BACKUP_ROOT))
+    depl.set_defaults(func=command_deploy)
 
     return parser
 
 
 def main():
-    parser = build_parser()
+    parser = build_argument_parser()
     args = parser.parse_args()
 
-    if not hasattr(args, "func"):
+    if hasattr(args, "func"):
+        args.func(args)
+    else:
         parser.print_help()
-        return
-
-    args.func(args)
 
 
 if __name__ == "__main__":
